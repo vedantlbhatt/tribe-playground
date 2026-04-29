@@ -17,8 +17,8 @@ PACE Phoenix notes
 
 Example (after scp to cluster)::
 
-    python tribe_v2.py --video ./clip.mp4 --output ./preds.npz
-    python tribe_v2.py --backend nforge --video ./clip.mp4
+    python tribe_v2.py --video ./high_stim.mp4 --output ./high_stim_preds.npz --cache-dir ./cache_high_stim
+    python tribe_v2.py --backend nforge --video ./high_stim.mp4
     python tribe_v2.py --backend tribe --audio ./audio.wav --cache-dir ./cache
 """
 
@@ -28,6 +28,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -187,7 +188,13 @@ def _log_torch_device() -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="TRIBE v2 inference (multimodal → cortical predictions)")
+    p = argparse.ArgumentParser(
+        description="TRIBE v2 inference (multimodal → cortical predictions)",
+        epilog=(
+            "Flags parsed after known options: --skip-transcription (or SKIP_TRANSCRIPTION=1), "
+            "--fresh-cache (delete --cache-dir first; fixes corrupt exca after quota/crash)."
+        ),
+    )
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--video", type=Path, help="Video file (.mp4, .avi, .mkv, .mov, .webm)")
     src.add_argument("--audio", type=Path, help="Audio file (.wav, .mp3, .flac, .ogg)")
@@ -208,13 +215,13 @@ def _parse_args() -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=Path("./cache"),
-        help="Feature cache directory (created if missing)",
+        help="Feature/exca cache directory (created if missing). On PACE Phoenix, paths under $HOME are mirrored to scratch automatically.",
     )
     p.add_argument(
         "--output",
         type=Path,
         default=Path("tribe_predictions.npz"),
-        help="Output .npz path for predictions array",
+        help="Output .npz for predictions. On PACE Phoenix, paths under $HOME are mirrored to scratch.",
     )
     p.add_argument(
         "--device",
@@ -232,11 +239,120 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable tqdm in predict()",
     )
-    return p.parse_args()
+    args, unknown = p.parse_known_args()
+    skip = False
+    fresh = False
+    bad: list[str] = []
+    for u in unknown:
+        if u == "--skip-transcription":
+            skip = True
+        elif u == "--fresh-cache":
+            fresh = True
+        else:
+            bad.append(u)
+    if bad:
+        p.error("unrecognized arguments: %s" % " ".join(bad))
+    args.skip_transcription = skip
+    args.fresh_cache = fresh
+    return args
+
+
+def _events_without_transcription(
+    *,
+    backend: str,
+    video: Path | None,
+    audio: Path | None,
+):
+    """Same event table as NForge/Tribe predictors, but audio_only=True (skips Whisper)."""
+
+    import pandas as pd
+
+    if video is not None:
+        event = {
+            "type": "Video",
+            "filepath": str(video.resolve()),
+            "start": 0,
+            "timeline": "default",
+            "subject": "default",
+        }
+    else:
+        event = {
+            "type": "Audio",
+            "filepath": str(audio.resolve()),
+            "start": 0,
+            "timeline": "default",
+            "subject": "default",
+        }
+
+    if backend == "nforge":
+        from nforge.inference.predictor import get_audio_and_text_events
+    else:
+        from tribev2.demo_utils import get_audio_and_text_events
+
+    return get_audio_and_text_events(pd.DataFrame([event]), audio_only=True)
+
+
+def _use_pace_scratch_caches() -> None:
+    """PACE home quota is tiny; uv, Hugging Face, and transformers default to ~/.cache — use scratch."""
+
+    user = os.environ.get("USER")
+    if not user:
+        return
+    scratch = Path(f"/storage/scratch1/1/{user}")
+    if not scratch.is_dir():
+        return
+
+    if not os.environ.get("UV_CACHE_DIR"):
+        d = scratch / ".uv-cache"
+        d.mkdir(parents=True, exist_ok=True)
+        os.environ["UV_CACHE_DIR"] = str(d)
+        logger.info("Set UV_CACHE_DIR=%s", d)
+
+    # transformers / hf_hub_download temp files were hitting home quota (errno 122)
+    if not os.environ.get("HF_HOME"):
+        hf = scratch / ".cache" / "huggingface"
+        hf.mkdir(parents=True, exist_ok=True)
+        os.environ["HF_HOME"] = str(hf)
+        logger.info("Set HF_HOME=%s", hf)
+    if not os.environ.get("TRANSFORMERS_CACHE"):
+        os.environ["TRANSFORMERS_CACHE"] = os.environ["HF_HOME"]
+        logger.info("Set TRANSFORMERS_CACHE=%s", os.environ["HF_HOME"])
+
+
+def _pace_rehome_if_under_home(path: Path, *, scratch_leaf: str, what: str) -> Path:
+    """PACE home quota: mirror paths under $HOME to /storage/scratch1/.../{scratch_leaf}/..."""
+
+    user = os.environ.get("USER")
+    if not user:
+        return path
+    scratch = Path(f"/storage/scratch1/1/{user}")
+    if not scratch.is_dir():
+        return path
+    try:
+        resolved = path.expanduser().resolve()
+        home = Path.home().resolve()
+        rel = resolved.relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return path
+    new = scratch / scratch_leaf / rel
+    logger.info("PACE: %s under home → scratch (%s → %s)", what, resolved, new)
+    return new
 
 
 def main() -> int:
     args = _parse_args()
+    if os.environ.get("SKIP_TRANSCRIPTION", "").strip().lower() in ("1", "true", "yes", "on"):
+        args.skip_transcription = True
+    _use_pace_scratch_caches()
+    args.cache_dir = _pace_rehome_if_under_home(
+        args.cache_dir, scratch_leaf="tribe_exca_cache", what="feature cache"
+    )
+    args.output = _pace_rehome_if_under_home(
+        args.output, scratch_leaf="tribe_outputs", what="output"
+    )
+    if args.fresh_cache and args.cache_dir.exists():
+        logger.info("Removing --cache-dir (--fresh-cache): %s", args.cache_dir)
+        shutil.rmtree(args.cache_dir)
     t0 = time.perf_counter()
 
     _log_torch_device()
@@ -279,8 +395,19 @@ def main() -> int:
             device=args.device,
         )
 
-    logger.info("Building events dataframe …")
-    df = model.get_events_dataframe(**{k: v for k, v in kwargs.items() if k.endswith("_path")})
+    if args.skip_transcription:
+        if args.text is not None:
+            logger.error("--skip-transcription does not apply to --text")
+            return 1
+        logger.info("Building events dataframe (transcription skipped) …")
+        df = _events_without_transcription(
+            backend=resolved,
+            video=args.video,
+            audio=args.audio,
+        )
+    else:
+        logger.info("Building events dataframe …")
+        df = model.get_events_dataframe(**{k: v for k, v in kwargs.items() if k.endswith("_path")})
 
     logger.info("Running predict …")
     preds, segments = model.predict(df, verbose=not args.quiet)
@@ -292,6 +419,7 @@ def main() -> int:
         "preds_shape": list(preds.shape),
         "n_segments": len(segments),
         "seconds": round(time.perf_counter() - t0, 3),
+        "skip_transcription": bool(args.skip_transcription),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
